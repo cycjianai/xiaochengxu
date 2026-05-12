@@ -1,0 +1,20 @@
+# Build artifacts
+build/
+dist/
+*.egg-info/
+
+# Virtual envs
+.venv/
+.venv-build/
+
+# Bytecode
+__pycache__/
+*.pyc
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Local data (user data lives in OS AppData, not repo)
+data.db
+sniffer_mac.db

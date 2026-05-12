@@ -1,0 +1,13 @@
+Flask>=3.0,<4.0
+requests>=2.31,<3.0
+pywebview>=5.1,<6.0
+# pywebview 在 Windows 上默认走 EdgeChromium(WebView2) 后端，需要 pythonnet；
+# 另外目标机需装 WebView2 Runtime（Win11 / 较新 Win10 自带，否则要单独装）。
+pythonnet>=3.0; sys_platform == "win32"
+# mitmproxy 11+：核心抓包引擎。本工具用 `regular` 模式（普通 HTTP 代理 + 系统代理切换），
+# 在进程内通过 DumpMaster 启动（外部看不到 mitmdump 子进程）。
+mitmproxy>=11,<12
+# Windows-only：pywebview 后端 / 注册表(winreg 是 stdlib，但 pywin32 留着备用)。
+pywin32>=306; sys_platform == "win32"
+# 反检测：回传后台的 HTTP 请求用 curl_cffi 模拟 Chrome 的 JA3 指纹（不可用时降级 requests）。
+curl_cffi>=0.6; python_version >= "3.10"
