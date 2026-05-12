@@ -36,16 +36,19 @@
 3. **统一→各平台推送报文**：对每个平台，列「统一字段 → 平台报文字段 + 是否必填 + 缺了怎么办」
 这份文档既是交付物，也是后面写代码的依据。
 
-### D2：类目对照 —— 新表 + 解析器，统一字段里加 per-platform 类目映射
+### D2：类目对照 —— 官方类目总表 + DeepSeek 选类目 + 对照表沉淀 + 解析器
 - **`ProductMaster` 不动**（`category_ids`/`category_path` 仍存「来源平台的」类目，作为「这个商品在它原平台是什么类目」的记录）。
-- **新表 `platform_category_mapping`**：`id, from_platform, from_category_id, from_category_path(TEXT, JSON, 可空, 用于 path 级匹配), to_platform, to_category_id, to_category_name, hit_count, created_at, updated_at`，唯一键 `(from_platform, from_category_id, to_platform)`。这是一张「逐步沉淀」的对照表。
-- **解析器** `resolve_target_category(db, master, to_platform, override_id=None) -> {id, name, source}`：
-  1. `override_id` 非空 → 直接用（source="manual"）
-  2. 查 `platform_category_mapping`：`from_platform=master.source_platform, from_category_id=master.category_ids[-1], to_platform`（命中 → source="mapping"，`hit_count += 1`）；也可按 `from_category_path` 模糊匹配
-  3. 若 `to_platform == master.source_platform`（同平台推送）→ 直接用 `master.category_ids[-1]`（source="native"）
-  4. 都没有 → 返回 `{id: None, source: "needs_manual"}` —— 端点据此返回「需指定目标类目」给 UI
-- **回写**：推送成功后，若用的是 `override_id`（manual）或 `native`（同平台首次），把这条 `(source_platform, source_cat) → (to_platform, used_cat)` upsert 进 `platform_category_mapping`，下次自动命中。
-- **替代（否决）**：在 `ProductMaster` 上加 `meituan_category_id` / `eleme_category_id` / `qnh_spu_id` 三个列 —— 太死板（平台多了要加列），用对照表更灵活。`source_product_id` 已经记了「源平台的 SPU/商品 id」，够了。
+- **新表 `platform_category_tree`**：缓存每个平台的官方商品标准类目树。字段：`id, platform, category_id, category_name, parent_id(可空), level(1/2/3...), is_leaf, full_path(TEXT, JSON 数组, 从根到本节点的名字), full_path_ids(TEXT, JSON 数组), fetched_at`，唯一键 `(platform, category_id)`。一次性抓取（之后偶尔刷新）—— 后台用 `cookies` 表里已有的美团/饿了么商家后台 cookie 去逆向「建商品时选类目」那个类目树接口，分页/递归拉全树写库（牵牛花不需要，覆盖更新用目标 SPU 自带类目）。
+- **新表 `platform_category_mapping`**：「逐步沉淀」的对照表。字段：`id, from_platform, from_category_id, from_category_path(TEXT, JSON, 可空, 用于 path 级匹配), to_platform, to_category_id, to_category_name, decided_by(manual/llm/native), hit_count, created_at, updated_at`，唯一键 `(from_platform, from_category_id, to_platform)`。
+- **DeepSeek 选类目** `llm_pick_category(target_tree, product_hint) -> {id, name, path, confidence}`：用后台已配的 `DEEPSEEK_*`（`api.deepseek.com`、`deepseek-v4-flash`），**逐层走树**：① 给 LLM 商品提示（标题、品牌、规格、源平台类目路径、几个关键属性）+ level-1 类目列表 → 选一级；② 在那个一级下给 level-2 列表 → 选二级；③ 给 level-3 叶子列表 → 选叶子。每层只给 10~50 个选项，3 次小调用。返回叶子类目 + 置信度（LLM 自评 high/medium/low，或按它给的理由判断）。置信度 low → 视为没选出来。
+- **解析器** `resolve_target_category(db, master, to_platform, override_id=None, use_llm=True) -> {id, name, source}`（`source` ∈ {manual, mapping, native, llm, needs_manual}）：
+  1. `override_id` 非空 → `{id: override_id, source: "manual"}`
+  2. 查 `platform_category_mapping`（`from_platform=master.source_platform, from_category_id=master 的源类目 id, to_platform`）命中 → `{..., source: "mapping"}`，`hit_count += 1`；也可按 `from_category_path` 模糊匹配
+  3. `to_platform == master.source_platform`（同平台推送）→ `{id: master 的源类目 id, source: "native"}`
+  4. `use_llm` 且目标平台的 `platform_category_tree` 已抓 → `llm_pick_category(...)`，置信度足够 → `{..., source: "llm"}`，并 `record_category_mapping(... decided_by="llm")`（缓存，下次走 step 2 命中）
+  5. 都没有（树没抓 / LLM 没把握）→ `{id: None, source: "needs_manual"}` —— 端点据此返回「需指定目标类目」给 UI
+- **回写**：推送成功后，用的目标类目若来自 `manual` 或 `native`（首次）→ upsert 进 `platform_category_mapping`（`decided_by` 记 manual/native）；`llm` 那条在 step 4 已经写过了。已存在则 `hit_count += 1`。
+- **替代（否决）**：① 在 `ProductMaster` 上加 `meituan_category_id` / `eleme_category_id` 列 —— 太死板，对照表更灵活。② 不要 LLM、纯让用户每次手填 —— 用户已明确要 DeepSeek，体验差太多。③ 把整棵树（几千节点）一次性塞给 LLM 让它选 —— 太大、贵、容易乱；逐层走树每层选项少、准、便宜。
 
 ### D3：推送端点稳健化
 - `ProductMasterPushBody` 增加可选 `category_overrides: dict[str(master_id), str(target_category_id)]`（UI 在对照表没命中时为每个 master 填）。

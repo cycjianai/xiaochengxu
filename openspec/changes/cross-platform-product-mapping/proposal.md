@@ -17,10 +17,11 @@
   - 4 个来源的 source→统一 映射（已存在的 `_upsert_meituan_product_master` / `_upsert_*` / `_upsert_sniffer_product_master` 各自怎么填这套字段）
   - 4 个平台的 统一→推送报文 映射（`MeituanPricePushService.push_product_master` 需要的 `categoryId/name/pictures/wmProductSkus/attrList/brandId/missingRequiredInfo`；`_build_eleme_push_payload` 需要的 `barcode/cateId/images/description/itemPropValues/specialPictures/店内分类`；牵牛花 `QnhOverwriteUpdateTaskService` 需要的 `目标SPU + 标准化的图/SKU/详情图`）
   - 哪些字段是「同义不同名」（可直接映射）、哪些是「平台特有」（需对照表 / 现场选 / 拿不到就空着）
-- **类目跨平台对照机制**：
-  - 新增 `platform_category_mapping` 表：`(from_platform, from_category_id, from_category_path?) → (to_platform, to_category_id, to_category_name)`，可逐步沉淀
-  - 「目标类目解析器」：给定一个 master + 目标平台 → 先查对照表；查不到时（若目标平台支持按 UPC/条码查标准库类目）尝试自动解析；再查不到 → 返回「需人工指定」
-  - 推送成功用过的对照关系自动回写进对照表（下次同类商品自动命中）
+- **类目跨平台对照机制（含 DeepSeek 选类目）**：
+  - 新增 `platform_category_tree` 表：缓存每个平台的官方商品标准类目树（一次性用已有商家后台 cookie 逆向「建商品选类目」接口拉全树写库；牵牛花不需要）
+  - 新增 `platform_category_mapping` 表：`(from_platform, from_category_id, from_category_path?) → (to_platform, to_category_id, to_category_name, decided_by)`，逐步沉淀
+  - **DeepSeek 选类目**：用后台已配的 `DEEPSEEK_*`（`api.deepseek.com` / `deepseek-v4-flash`），给一个商品（标题/品牌/规格/源平台类目路径）在目标平台类目树里**逐层走**（先选一级→再二级→再三级叶子，每层 10~50 个选项、3 次小调用）选出叶子类目
+  - 「目标类目解析器」：override → 对照表命中 → 同平台原生 → **DeepSeek 选（树已抓且有把握）** → 都没有就「需人工指定」；DeepSeek/手填的结果都回写进对照表，下次同类商品直接命中、不再调 LLM
 - **推送端点对任意来源稳健化**：
   - `/master/push-to-meituan` / `/master/push-to-eleme` 的 body 增加可选的 per-master `target_category_id`（对照表没命中时由 UI 传）
   - 推送时：`categoryId`/`cateId` 优先用「解析出的目标平台类目」（对照表 / UI 传入 / 自动解析），不再盲目用 master 身上的源类目
@@ -36,7 +37,8 @@
 
 ### New Capabilities
 - `unified-product-schema`：跨 4 平台的统一商品 schema + 各来源的 source→统一 映射 + 各平台的 统一→推送报文 映射 的契约文档（哪些字段同义、哪些平台特有）
-- `cross-platform-category-mapping`：类目跨平台对照表 + 目标类目解析器 + 推送时用对照表/UI/自动解析定类目 + 成功后回写对照 的契约
+- `cross-platform-category-mapping`：类目跨平台对照表 + 目标类目解析器（override→对照表→原生→需人工）+ 推送时用它定类目 + 成功后回写对照 的契约
+- `llm-category-resolution`：官方类目总表（`platform_category_tree`，用已有 cookie 自动抓）+ DeepSeek 在目标平台类目树里逐层走选叶子类目 + 选出的结果缓存进对照表 的契约
 - `any-source-push`：推送端点对任意来源商品稳健化（必填字段从统一字段派生、宽松完整性校验、target_category 覆盖）的契约
 
 ### Modified Capabilities
