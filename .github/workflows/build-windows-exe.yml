@@ -1,0 +1,33 @@
+name: build-windows-exe
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+
+jobs:
+  build-windows-exe:
+    runs-on: windows-latest
+    env:
+      WX_SNIFFER_PRODUCT_NAME: MTCenter
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Build Windows EXE
+        shell: powershell
+        run: .\scripts\build_win.ps1
+
+      - name: Upload Windows artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-exe-${{ env.WX_SNIFFER_PRODUCT_NAME }}
+          path: dist/${{ env.WX_SNIFFER_PRODUCT_NAME }}
+          if-no-files-found: error
+          retention-days: 7

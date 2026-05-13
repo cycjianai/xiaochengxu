@@ -146,6 +146,16 @@ scripts/build_mac.sh         # → dist/MTCenter.app
 scripts\build_win.ps1        # → dist\MTCenter\
 ```
 
+## GitHub 自动构建 Windows EXE
+
+仓库提供了 GitHub Actions 工作流 `.github/workflows/build-windows-exe.yml`。
+
+1. 打开 GitHub 仓库的 **Actions**
+2. 选择 **build-windows-exe**
+3. 点击 **Run workflow** 手动触发（推送到 `main` 也会自动触发）
+4. 构建完成后，在该次 workflow 的 **Artifacts** 下载 `windows-exe-MTCenter`
+5. 解压后主程序位于 `dist\MTCenter\MTCenter.exe`
+
 ## 关键文件
 
 | 路径 | 说明 |
