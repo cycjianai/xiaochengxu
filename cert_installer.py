@@ -17,15 +17,24 @@ def _mitm_cert_path() -> Path:
     return mitmproxy_dir() / "mitmproxy-ca-cert.pem"
 
 
+def _load_cert(pem_path: Path):
+    from cryptography import x509  # mitmproxy depends on cryptography, so this is available
+    from cryptography.hazmat.backends import default_backend
+
+    data = pem_path.read_bytes()
+    if data.startswith(b"\xef\xbb\xbf"):
+        data = data[3:]
+    try:
+        return x509.load_pem_x509_certificate(data, default_backend())
+    except ValueError:
+        return x509.load_der_x509_certificate(data, default_backend())
+
+
 def _read_cert_not_after(pem_path: Path) -> datetime.datetime | None:
     if not pem_path.exists():
         return None
     try:
-        from cryptography import x509  # mitmproxy depends on cryptography, so this is available
-        from cryptography.hazmat.backends import default_backend
-
-        data = pem_path.read_bytes()
-        cert = x509.load_pem_x509_certificate(data, default_backend())
+        cert = _load_cert(pem_path)
         return cert.not_valid_after
     except Exception as exc:
         add_log("WARN", f"读取 mitmproxy 根证书失败: {exc}")
@@ -68,12 +77,9 @@ def _is_trusted_macos(pem_path: Path) -> bool:
     if not sec:
         return False
     try:
-        # Compute SHA1 of the cert (matches the plist key format)
-        from cryptography import x509
-        from cryptography.hazmat.backends import default_backend
         from cryptography.hazmat.primitives import hashes
 
-        cert = x509.load_pem_x509_certificate(pem_path.read_bytes(), default_backend())
+        cert = _load_cert(pem_path)
         sha1_hex = cert.fingerprint(hashes.SHA1()).hex().upper()
 
         with tempfile.NamedTemporaryFile(suffix=".plist", delete=False) as tf:
@@ -151,8 +157,50 @@ def _install_macos(pem_path: Path) -> bool:
     return False
 
 
-def _is_trusted_windows() -> bool:  # pragma: no cover - windows only
-    """查当前用户的「受信任的根证书颁发机构」存储里有没有 mitmproxy CA。"""
+def _windows_powershell() -> str | None:  # pragma: no cover - windows only
+    return shutil.which("powershell") or shutil.which("pwsh")
+
+
+def _run_windows_powershell(script: str, timeout: int) -> subprocess.CompletedProcess | None:  # pragma: no cover - windows only
+    shell = _windows_powershell()
+    if not shell:
+        return None
+    return subprocess.run(
+        [shell, "-NoProfile", "-NonInteractive", "-Command", script],
+        capture_output=True,
+        text=True,
+        errors="ignore",
+        timeout=timeout,
+    )
+
+
+def _windows_cert_thumbprint(pem_path: Path) -> str | None:  # pragma: no cover - windows only
+    try:
+        from cryptography.hazmat.primitives import hashes
+
+        cert = _load_cert(pem_path)
+        return cert.fingerprint(hashes.SHA1()).hex().upper()
+    except Exception as exc:
+        add_log("WARN", f"计算 mitmproxy 证书指纹失败: {exc}")
+        return None
+
+
+def _is_trusted_windows(pem_path: Path) -> bool:  # pragma: no cover - windows only
+    """查当前用户的「受信任的根证书颁发机构」存储里有没有当前 mitmproxy CA。"""
+    thumbprint = _windows_cert_thumbprint(pem_path)
+    if thumbprint:
+        script = (
+            "$cert = Get-ChildItem -Path Cert:\\CurrentUser\\Root | "
+            f"Where-Object {{ $_.Thumbprint -ieq '{thumbprint}' }} | Select-Object -First 1; "
+            "if ($null -ne $cert) { exit 0 } else { exit 1 }"
+        )
+        try:
+            result = _run_windows_powershell(script, timeout=15)
+            if result is not None:
+                return result.returncode == 0
+        except Exception:
+            pass
+
     cu = shutil.which("certutil")
     if not cu:
         return False
@@ -166,12 +214,52 @@ def _is_trusted_windows() -> bool:  # pragma: no cover - windows only
         return False
 
 
+def _install_windows_via_powershell(pem_path: Path) -> bool:  # pragma: no cover - windows only
+    try:
+        from cryptography.hazmat.primitives import serialization
+
+        cert = _load_cert(pem_path)
+        der_bytes = cert.public_bytes(serialization.Encoding.DER)
+    except Exception as exc:
+        add_log("WARN", f"准备 Windows 证书导入文件失败: {exc}")
+        return False
+
+    temp_path: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(suffix=".cer", delete=False) as tf:
+            tf.write(der_bytes)
+            temp_path = Path(tf.name)
+        quoted_path = str(temp_path).replace("'", "''")
+        script = (
+            "$ProgressPreference = 'SilentlyContinue'; "
+            f"Import-Certificate -FilePath '{quoted_path}' -CertStoreLocation 'Cert:\\CurrentUser\\Root' | Out-Null"
+        )
+        result = _run_windows_powershell(script, timeout=120)
+        if result is None:
+            return False
+        if result.returncode == 0:
+            return True
+        detail = ((result.stderr or result.stdout) or "").strip()
+        add_log("WARN", f"PowerShell 安装证书失败: {detail[:200]}")
+        return False
+    except Exception as exc:
+        add_log("WARN", f"Windows PowerShell 安装 mitmproxy 证书失败: {exc}")
+        return False
+    finally:
+        if temp_path is not None:
+            try:
+                temp_path.unlink()
+            except Exception:
+                pass
+
+
 def _install_windows(pem_path: Path) -> bool:  # pragma: no cover - windows only
-    """certutil -user -addstore Root <pem> —— 装进当前用户的「受信任的根证书颁发机构」。
-    无需管理员，会弹一次 Windows 安全确认框（点「是」），等同 Mac 上那一下密码框；
-    点完之后 `is_cert_trusted()` 返回 True，不会再弹。"""
+    """优先静默导入当前用户 Root；失败时退回 certutil。"""
     if not pem_path.exists():
         return False
+    if _install_windows_via_powershell(pem_path) and _is_trusted_windows(pem_path):
+        return True
+
     cu = shutil.which("certutil")
     if not cu:
         add_log("WARN", "未找到 certutil，无法自动安装证书；请手动把 mitmproxy 根证书装进「受信任的根证书颁发机构」")
@@ -183,7 +271,7 @@ def _install_windows(pem_path: Path) -> bool:  # pragma: no cover - windows only
         )
         out = ((r.stdout or "") + (r.stderr or "")).lower()
         if r.returncode == 0 or "already" in out or "已存在" in ((r.stdout or "") + (r.stderr or "")):
-            return True
+            return _is_trusted_windows(pem_path)
         add_log("WARN", f"certutil 安装证书失败(rc={r.returncode}): {((r.stderr or r.stdout) or '').strip()[:200]}")
         return False
     except Exception as exc:
@@ -196,7 +284,7 @@ def is_cert_trusted() -> bool:
     if sys.platform == "darwin":
         return _is_trusted_macos(pem)
     if sys.platform.startswith("win"):
-        return _is_trusted_windows()
+        return _is_trusted_windows(pem)
     return pem.exists()
 
 
@@ -221,9 +309,9 @@ def install_cert_if_needed() -> dict:
             result["installed"] = _install_macos(pem)
         result["trusted"] = _is_trusted_macos(pem)
     elif sys.platform.startswith("win"):
-        if not _is_trusted_windows():
+        if not _is_trusted_windows(pem):
             result["installed"] = _install_windows(pem)
-        result["trusted"] = _is_trusted_windows()
+        result["trusted"] = _is_trusted_windows(pem)
     else:
         result["trusted"] = pem.exists()
     return result
