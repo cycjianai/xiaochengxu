@@ -40,15 +40,34 @@ CONFLICTING_PROCESS_NAMES = {
 }
 
 
+def _windows_subprocess_kwargs(subprocess_module) -> dict:
+    """Hide helper console windows when the packaged app probes system state."""
+    if not sys.platform.startswith("win"):
+        return {}
+    startupinfo = subprocess_module.STARTUPINFO()
+    startupinfo.dwFlags |= subprocess_module.STARTF_USESHOWWINDOW
+    startupinfo.wShowWindow = 0
+    return {
+        "creationflags": getattr(subprocess_module, "CREATE_NO_WINDOW", 0),
+        "startupinfo": startupinfo,
+    }
+
+
 def _iter_process_names() -> Iterable[str]:
     """Yield lowercase process basenames. Best-effort, no hard dep on psutil."""
     if sys.platform.startswith("win"):
         try:
             import subprocess
 
-            out = subprocess.check_output(
-                ["tasklist", "/FO", "CSV", "/NH"], text=True, timeout=5
+            result = subprocess.run(
+                ["tasklist", "/FO", "CSV", "/NH"],
+                capture_output=True,
+                text=True,
+                timeout=5,
+                check=False,
+                **_windows_subprocess_kwargs(subprocess),
             )
+            out = result.stdout
             for line in out.splitlines():
                 parts = [p.strip().strip('"') for p in line.split(",")]
                 if parts and parts[0]:
