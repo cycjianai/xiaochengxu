@@ -157,23 +157,6 @@ def _install_macos(pem_path: Path) -> bool:
     return False
 
 
-def _windows_powershell() -> str | None:  # pragma: no cover - windows only
-    return shutil.which("powershell") or shutil.which("pwsh")
-
-
-def _run_windows_powershell(script: str, timeout: int) -> subprocess.CompletedProcess | None:  # pragma: no cover - windows only
-    shell = _windows_powershell()
-    if not shell:
-        return None
-    return subprocess.run(
-        [shell, "-NoProfile", "-NonInteractive", "-Command", script],
-        capture_output=True,
-        text=True,
-        errors="ignore",
-        timeout=timeout,
-    )
-
-
 def _windows_cert_thumbprint(pem_path: Path) -> str | None:  # pragma: no cover - windows only
     try:
         from cryptography.hazmat.primitives import hashes
@@ -185,98 +168,97 @@ def _windows_cert_thumbprint(pem_path: Path) -> str | None:  # pragma: no cover 
         return None
 
 
-def _is_trusted_windows(pem_path: Path) -> bool:  # pragma: no cover - windows only
-    """查当前用户的「受信任的根证书颁发机构」存储里有没有当前 mitmproxy CA。"""
-    thumbprint = _windows_cert_thumbprint(pem_path)
-    if thumbprint:
-        script = (
-            "$cert = Get-ChildItem -Path Cert:\\CurrentUser\\Root | "
-            f"Where-Object {{ $_.Thumbprint -ieq '{thumbprint}' }} | Select-Object -First 1; "
-            "if ($null -ne $cert) { exit 0 } else { exit 1 }"
-        )
-        try:
-            result = _run_windows_powershell(script, timeout=15)
-            if result is not None:
-                return result.returncode == 0
-        except Exception:
-            pass
+def _iter_windows_root_thumbprints():  # pragma: no cover - windows only
+    import ssl
+    from cryptography import x509
+    from cryptography.hazmat.backends import default_backend
+    from cryptography.hazmat.primitives import hashes
 
-    cu = shutil.which("certutil")
-    if not cu:
+    for cert_bytes, encoding, _trust in ssl.enum_certificates("ROOT"):
+        if encoding != "x509_asn":
+            continue
+        try:
+            cert = x509.load_der_x509_certificate(cert_bytes, default_backend())
+            yield cert.fingerprint(hashes.SHA1()).hex().upper()
+        except Exception:
+            continue
+
+
+def _is_trusted_windows(pem_path: Path) -> bool:  # pragma: no cover - windows only
+    """查当前用户可见的 ROOT 证书存储里有没有当前 mitmproxy CA。"""
+    thumbprint = _windows_cert_thumbprint(pem_path)
+    if not thumbprint:
         return False
     try:
-        r = subprocess.run(
-            [cu, "-user", "-store", "Root"],
-            capture_output=True, text=True, errors="ignore", timeout=15,
-        )
-        return r.returncode == 0 and "mitmproxy" in ((r.stdout or "") + (r.stderr or "")).lower()
+        return any(existing == thumbprint for existing in _iter_windows_root_thumbprints())
     except Exception:
         return False
 
 
-def _install_windows_via_powershell(pem_path: Path) -> bool:  # pragma: no cover - windows only
+def _install_windows_via_crypt32(pem_path: Path) -> bool:  # pragma: no cover - windows only
     try:
+        import ctypes
         from cryptography.hazmat.primitives import serialization
 
         cert = _load_cert(pem_path)
         der_bytes = cert.public_bytes(serialization.Encoding.DER)
     except Exception as exc:
-        add_log("WARN", f"准备 Windows 证书导入文件失败: {exc}")
+        add_log("WARN", f"准备 Windows 证书导入数据失败: {exc}")
         return False
 
-    temp_path: Path | None = None
+    X509_ASN_ENCODING = 0x00000001
+    PKCS_7_ASN_ENCODING = 0x00010000
+    CERT_STORE_ADD_USE_EXISTING = 2
+
     try:
-        with tempfile.NamedTemporaryFile(suffix=".cer", delete=False) as tf:
-            tf.write(der_bytes)
-            temp_path = Path(tf.name)
-        quoted_path = str(temp_path).replace("'", "''")
-        script = (
-            "$ProgressPreference = 'SilentlyContinue'; "
-            f"Import-Certificate -FilePath '{quoted_path}' -CertStoreLocation 'Cert:\\CurrentUser\\Root' | Out-Null"
-        )
-        result = _run_windows_powershell(script, timeout=120)
-        if result is None:
+        crypt32 = ctypes.WinDLL("crypt32", use_last_error=True)
+        crypt32.CertOpenSystemStoreW.argtypes = [ctypes.c_void_p, ctypes.c_wchar_p]
+        crypt32.CertOpenSystemStoreW.restype = ctypes.c_void_p
+        crypt32.CertAddEncodedCertificateToStore.argtypes = [
+            ctypes.c_void_p,
+            ctypes.c_uint32,
+            ctypes.c_void_p,
+            ctypes.c_uint32,
+            ctypes.c_uint32,
+            ctypes.c_void_p,
+        ]
+        crypt32.CertAddEncodedCertificateToStore.restype = ctypes.c_bool
+        crypt32.CertCloseStore.argtypes = [ctypes.c_void_p, ctypes.c_uint32]
+        crypt32.CertCloseStore.restype = ctypes.c_bool
+
+        store = crypt32.CertOpenSystemStoreW(None, "ROOT")
+        if not store:
+            add_log("WARN", f"打开 Windows ROOT 证书存储失败: {ctypes.WinError(ctypes.get_last_error())}")
             return False
-        if result.returncode == 0:
+
+        try:
+            encoded = ctypes.create_string_buffer(der_bytes)
+            ok = crypt32.CertAddEncodedCertificateToStore(
+                store,
+                X509_ASN_ENCODING | PKCS_7_ASN_ENCODING,
+                ctypes.cast(encoded, ctypes.c_void_p),
+                len(der_bytes),
+                CERT_STORE_ADD_USE_EXISTING,
+                None,
+            )
+            if not ok:
+                add_log("WARN", f"写入 Windows ROOT 证书存储失败: {ctypes.WinError(ctypes.get_last_error())}")
+                return False
             return True
-        detail = ((result.stderr or result.stdout) or "").strip()
-        add_log("WARN", f"PowerShell 安装证书失败: {detail[:200]}")
-        return False
+        finally:
+            crypt32.CertCloseStore(store, 0)
     except Exception as exc:
-        add_log("WARN", f"Windows PowerShell 安装 mitmproxy 证书失败: {exc}")
+        add_log("WARN", f"Windows crypt32 安装 mitmproxy 证书失败: {exc}")
         return False
-    finally:
-        if temp_path is not None:
-            try:
-                temp_path.unlink()
-            except Exception:
-                pass
 
 
 def _install_windows(pem_path: Path) -> bool:  # pragma: no cover - windows only
-    """优先静默导入当前用户 Root；失败时退回 certutil。"""
+    """静默导入当前用户 ROOT 证书存储，不弹 PowerShell/certutil 窗口。"""
     if not pem_path.exists():
         return False
-    if _install_windows_via_powershell(pem_path) and _is_trusted_windows(pem_path):
-        return True
-
-    cu = shutil.which("certutil")
-    if not cu:
-        add_log("WARN", "未找到 certutil，无法自动安装证书；请手动把 mitmproxy 根证书装进「受信任的根证书颁发机构」")
-        return False
-    try:
-        r = subprocess.run(
-            [cu, "-user", "-addstore", "Root", str(pem_path)],
-            capture_output=True, text=True, errors="ignore", timeout=120,
-        )
-        out = ((r.stdout or "") + (r.stderr or "")).lower()
-        if r.returncode == 0 or "already" in out or "已存在" in ((r.stdout or "") + (r.stderr or "")):
-            return _is_trusted_windows(pem_path)
-        add_log("WARN", f"certutil 安装证书失败(rc={r.returncode}): {((r.stderr or r.stdout) or '').strip()[:200]}")
-        return False
-    except Exception as exc:
-        add_log("WARN", f"Windows 安装 mitmproxy 证书失败: {exc}")
-        return False
+    if _install_windows_via_crypt32(pem_path):
+        return _is_trusted_windows(pem_path)
+    return False
 
 
 def is_cert_trusted() -> bool:
@@ -291,7 +273,7 @@ def is_cert_trusted() -> bool:
 def install_cert_if_needed() -> dict:
     pem = _mitm_cert_path()
     result = {"trusted": False, "installed": False, "rotated": False}
-    if pem.exists():
+    if pem.exists() and sys.platform == "darwin":
         not_after = _read_cert_not_after(pem)
         if not_after is not None:
             days_left = (not_after - datetime.datetime.utcnow()).days
