@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import asyncio
+import errno
 import shutil
+import socket
 import threading
 import time
 from pathlib import Path
@@ -181,6 +183,9 @@ class AbstractProxyManager:
         return {"success": False, "running": False, "message": self._last_message}
 
     def _launch_master(self, mode: str) -> tuple[bool, str]:
+        preflight_error = self._preflight_listen(mode)
+        if preflight_error:
+            return False, preflight_error
         try:
             self._spawn_master_thread(mode)
         except Exception as exc:
@@ -193,6 +198,37 @@ class AbstractProxyManager:
             if self._master is not None:
                 break
         return True, f"已启动 mode={mode}"
+
+    def _preflight_listen(self, mode: str) -> str | None:
+        if mode not in {"regular", "wireguard"}:
+            return None
+        cfg = load_config()["capture"]
+        host = str(cfg["listen_host"])
+        port = int(cfg["listen_port"])
+        try:
+            infos = socket.getaddrinfo(host, port, type=socket.SOCK_STREAM, flags=socket.AI_PASSIVE)
+        except OSError as exc:
+            return f"解析监听地址失败 {host}:{port}: {exc}"
+
+        last_error: OSError | None = None
+        for family, socktype, proto, _canonname, sockaddr in infos:
+            sock = None
+            try:
+                sock = socket.socket(family, socktype, proto)
+                sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                sock.bind(sockaddr)
+                return None
+            except OSError as exc:
+                last_error = exc
+            finally:
+                if sock is not None:
+                    sock.close()
+
+        if last_error is None:
+            return f"无法监听 {host}:{port}"
+        if last_error.errno == errno.EADDRINUSE:
+            return f"{host}:{port} 端口已被占用，请关闭占用进程或修改 capture.listen_port"
+        return f"无法监听 {host}:{port}: {last_error}"
 
     def _build_options(self, mode: str):
         from mitmproxy.options import Options
